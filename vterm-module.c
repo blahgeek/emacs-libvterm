@@ -10,8 +10,66 @@
 #include <unistd.h>
 #include <vterm.h>
 
+typedef struct MyMallocRecord {
+  void* ptr;
+  size_t size;
+  int line;
+} MyMallocRecord;
+
+#define RECORD_SIZE (1024 * 1024)
+
+static MyMallocRecord* get_malloc_records() {
+  static MyMallocRecord* s_record = NULL;
+  if (s_record == NULL) {
+    fprintf(stderr, "Init malloc records\n");
+    s_record = (MyMallocRecord*)malloc(sizeof(MyMallocRecord) * RECORD_SIZE);
+    memset(s_record, 0, sizeof(MyMallocRecord) * RECORD_SIZE);
+  }
+  return s_record;
+}
+
+static void* my_malloc(size_t s, int line) {
+  void* p = malloc(s);
+  MyMallocRecord* record = get_malloc_records();
+  while (record->ptr)
+    record++;
+  record->ptr = p;
+  record->size = s;
+  record->line = line;
+  return p;
+}
+
+#define MY_MALLOC(s) my_malloc((s), __LINE__)
+
+static void my_free(void* p) {
+  free(p);
+
+  MyMallocRecord* record = get_malloc_records();
+  for (int i = 0 ; i < RECORD_SIZE ; i += 1, record ++) {
+    if (record->ptr == p)
+      break;
+  }
+  assert(record->ptr == p);
+  record->ptr = NULL;
+  record->size = 0;
+  record->line = 0;
+}
+
+static void my_leak_report() {
+  fprintf(stderr, "LEAK REPORT\n");
+  size_t total = 0;
+  MyMallocRecord* record = get_malloc_records();
+  for (int i = 0 ; i < RECORD_SIZE ; i += 1, record ++) {
+    if (record->ptr != NULL) {
+      fprintf(stderr, "LEAK: %zu, %d\n", record->size, record->line);
+      total += record->size;
+    }
+  }
+  fprintf(stderr, "LEAK REPORT FINISH: total %zu\n", total);
+}
+
 static LineInfo *alloc_lineinfo() {
-  LineInfo *info = malloc(sizeof(LineInfo));
+  LineInfo *info = MY_MALLOC(sizeof(LineInfo));
   info->directory = NULL;
   info->prompt_col = -1;
   return info;
@@ -21,10 +79,10 @@ void free_lineinfo(LineInfo *line) {
     return;
   }
   if (line->directory != NULL) {
-    free(line->directory);
+    my_free(line->directory);
     line->directory = NULL;
   }
-  free(line);
+  my_free(line);
 }
 static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
   Term *term = (Term *)data;
@@ -45,7 +103,7 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
         free_lineinfo(term->sb_buffer[term->sb_current - 1]->info);
         term->sb_buffer[term->sb_current - 1]->info = NULL;
       }
-      free(term->sb_buffer[term->sb_current - 1]);
+      my_free(term->sb_buffer[term->sb_current - 1]);
     }
 
     // Make room at the start by shifting to the right.
@@ -59,7 +117,7 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
   }
 
   if (!sbrow) {
-    sbrow = malloc(sizeof(ScrollbackLine) + c * sizeof(sbrow->cells[0]));
+    sbrow = MY_MALLOC(sizeof(ScrollbackLine) + c * sizeof(sbrow->cells[0]));
     sbrow->cols = c;
     sbrow->info = NULL;
   }
@@ -72,7 +130,7 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
   if (term->resizing) {
     /* pushed by window height decr */
     if (term->lines[term->lines_len - 1] != NULL) {
-      /* do not need free here ,it is reused ,we just need set null */
+      /* do not need my_free here ,it is reused ,we just need set null */
       term->lines[term->lines_len - 1] = NULL;
     }
     term->lines_len--;
@@ -81,7 +139,7 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
     if (lastline != NULL) {
       LineInfo *line = alloc_lineinfo();
       if (lastline->directory != NULL) {
-        line->directory = malloc(1 + strlen(lastline->directory));
+        line->directory = MY_MALLOC(1 + strlen(lastline->directory));
         strcpy(line->directory, lastline->directory);
       }
       term->lines[term->lines_len - 1] = line;
@@ -142,13 +200,13 @@ static int term_sb_pop(int cols, VTermScreenCell *cells, void *data) {
     cells[col].width = 1;
   }
 
-  LineInfo **lines = malloc(sizeof(LineInfo *) * (term->lines_len + 1));
+  LineInfo **lines = MY_MALLOC(sizeof(LineInfo *) * (term->lines_len + 1));
 
   memmove(lines + 1, term->lines, sizeof(term->lines[0]) * term->lines_len);
   lines[0] = sbrow->info;
-  free(sbrow);
+  my_free(sbrow);
   term->lines_len += 1;
-  free(term->lines);
+  my_free(term->lines);
   term->lines = lines;
 
   return 1;
@@ -380,7 +438,7 @@ static int term_resize(int rows, int cols, void *user_data) {
   if (rows > term->height) {
     if (rows > term->lines_len) {
       LineInfo **infos = term->lines;
-      term->lines = malloc(sizeof(LineInfo *) * rows);
+      term->lines = MY_MALLOC(sizeof(LineInfo *) * rows);
       memmove(term->lines, infos, sizeof(infos[0]) * term->lines_len);
 
       LineInfo *lastline = term->lines[term->lines_len - 1];
@@ -389,7 +447,7 @@ static int term_resize(int rows, int cols, void *user_data) {
           LineInfo *line = alloc_lineinfo();
           if (lastline->directory != NULL) {
             line->directory =
-                malloc(1 + strlen(term->lines[term->lines_len - 1]->directory));
+                MY_MALLOC(1 + strlen(term->lines[term->lines_len - 1]->directory));
             strcpy(line->directory,
                    term->lines[term->lines_len - 1]->directory);
           }
@@ -399,7 +457,7 @@ static int term_resize(int rows, int cols, void *user_data) {
         }
       }
       term->lines_len = rows;
-      free(infos);
+      my_free(infos);
     }
   }
 
@@ -575,7 +633,7 @@ static void term_redraw(Term *term, emacs_env *env) {
     emacs_value elisp_code =
         env->make_string(env, term->elisp_code, strlen(term->elisp_code));
     vterm_eval(env, elisp_code);
-    free(term->elisp_code);
+    my_free(term->elisp_code);
     term->elisp_code = NULL;
   }
 
@@ -612,9 +670,9 @@ static bool is_key(unsigned char *key, size_t len, char *key_description) {
 static void term_set_title(Term *term, char *title) {
   size_t len = strlen(title);
   if (term->title) {
-    free(term->title);
+    my_free(term->title);
   }
-  term->title = malloc(sizeof(char) * (len + 1));
+  term->title = MY_MALLOC(sizeof(char) * (len + 1));
   strncpy(term->title, title, len);
   term->title[len] = 0;
   term->title_changed = true;
@@ -776,10 +834,10 @@ static void term_clear_scrollback(Term *term, emacs_env *env) {
       free_lineinfo(term->sb_buffer[i]->info);
       term->sb_buffer[i]->info = NULL;
     }
-    free(term->sb_buffer[i]);
+    my_free(term->sb_buffer[i]);
   }
-  free(term->sb_buffer);
-  term->sb_buffer = malloc(sizeof(ScrollbackLine *) * term->sb_size);
+  my_free(term->sb_buffer);
+  term->sb_buffer = MY_MALLOC(sizeof(ScrollbackLine *) * term->sb_size);
   delete_lines(env, 1, term->sb_current, true);
   term->linenum -= term->sb_current;
   term->sb_current = 0;
@@ -892,19 +950,20 @@ void term_finalize(void *object) {
       free_lineinfo(term->sb_buffer[i]->info);
       term->sb_buffer[i]->info = NULL;
     }
-    free(term->sb_buffer[i]);
+    my_free(term->sb_buffer[i]);
   }
+
   if (term->title) {
-    free(term->title);
+    my_free(term->title);
     term->title = NULL;
   }
 
   if (term->directory) {
-    free(term->directory);
+    my_free(term->directory);
     term->directory = NULL;
   }
   if (term->elisp_code) {
-    free(term->elisp_code);
+    my_free(term->elisp_code);
     term->elisp_code = NULL;
   }
   for (int i = 0; i < term->lines_len; i++) {
@@ -913,14 +972,17 @@ void term_finalize(void *object) {
       term->lines[i] = NULL;
     }
   }
+  my_free(term->lines);
 
   if (term->pty_fd > 0) {
     close(term->pty_fd);
   }
 
-  free(term->sb_buffer);
+  my_free(term->sb_buffer);
   vterm_free(term->vt);
-  free(term);
+  my_free(term);
+
+  my_leak_report();
 }
 
 static int osc_callback(const char *command, size_t cmdlen, void *user) {
@@ -941,10 +1003,10 @@ static int osc_callback(const char *command, size_t cmdlen, void *user) {
   if (cmdlen > 4 && buffer[0] == '5' && buffer[1] == '1' && buffer[2] == ';' &&
       buffer[3] == 'A') {
     if (term->directory != NULL) {
-      free(term->directory);
+      my_free(term->directory);
       term->directory = NULL;
     }
-    term->directory = malloc(cmdlen - 4 + 1);
+    term->directory = MY_MALLOC(cmdlen - 4 + 1);
     strcpy(term->directory, &buffer[4]);
     term->directory_changed = true;
 
@@ -954,9 +1016,9 @@ static int osc_callback(const char *command, size_t cmdlen, void *user) {
       }
 
       if (term->lines[i]->directory != NULL) {
-        free(term->lines[i]->directory);
+        my_free(term->lines[i]->directory);
       }
-      term->lines[i]->directory = malloc(cmdlen - 4 + 1);
+      term->lines[i]->directory = MY_MALLOC(cmdlen - 4 + 1);
       strcpy(term->lines[i]->directory, &buffer[4]);
       if (i == term->cursor.row) {
         term->lines[i]->prompt_col = term->cursor.col;
@@ -967,7 +1029,7 @@ static int osc_callback(const char *command, size_t cmdlen, void *user) {
     return 1;
   } else if (cmdlen > 4 && buffer[0] == '5' && buffer[1] == '1' &&
              buffer[2] == ';' && buffer[3] == 'E') {
-    term->elisp_code = malloc(cmdlen - 4 + 1);
+    term->elisp_code = MY_MALLOC(cmdlen - 4 + 1);
     strcpy(term->elisp_code, &buffer[4]);
     term->elisp_code_changed = true;
     return 1;
@@ -986,7 +1048,7 @@ static VTermParserCallbacks parser_callbacks = {
 
 emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
                        void *data) {
-  Term *term = malloc(sizeof(Term));
+  Term *term = MY_MALLOC(sizeof(Term));
 
   int rows = env->extract_integer(env, args[0]);
   int cols = env->extract_integer(env, args[1]);
@@ -1011,7 +1073,7 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   term->sb_current = 0;
   term->sb_pending = 0;
   term->sb_pending_by_height_decr = 0;
-  term->sb_buffer = malloc(sizeof(ScrollbackLine *) * term->sb_size);
+  term->sb_buffer = MY_MALLOC(sizeof(ScrollbackLine *) * term->sb_size);
   term->invalid_start = 0;
   term->invalid_end = rows;
   term->width = cols;
@@ -1040,7 +1102,7 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   term->elisp_code = NULL;
   term->elisp_code_changed = false;
 
-  term->lines = malloc(sizeof(LineInfo *) * rows);
+  term->lines = MY_MALLOC(sizeof(LineInfo *) * rows);
   term->lines_len = rows;
   for (int i = 0; i < rows; i++) {
     term->lines[i] = NULL;
