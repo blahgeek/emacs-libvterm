@@ -596,16 +596,22 @@ static void term_redraw(Term *term, emacs_env *env) {
     term->directory_changed = false;
   }
 
-  while (term->elisp_code_first) {
-    ElispCodeListNode *node = term->elisp_code_first;
-    term->elisp_code_first = node->next;
-    emacs_value elisp_code = env->make_string(env, node->code, node->code_len);
-    vterm_eval(env, elisp_code);
+  if (term->elisp_code_first) {
+    // Clear member variables first because this function must be reentrant on eval
+    ElispCodeListNode* node = term->elisp_code_first;
+    term->elisp_code_first = NULL;
+    term->elisp_code_p_insert = &term->elisp_code_first;
 
-    free(node->code);
-    free(node);
+    while (node) {
+      emacs_value elisp_code = env->make_string(env, node->code, node->code_len);
+      vterm_eval(env, elisp_code);
+
+      ElispCodeListNode* next = node->next;
+      free(node->code);
+      free(node);
+      node = next;
+    }
   }
-  term->elisp_code_p_insert = &term->elisp_code_first;
 
   if (term->selection_data) {
     emacs_value selection_target = env->make_string(
